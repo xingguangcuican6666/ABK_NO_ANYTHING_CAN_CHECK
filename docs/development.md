@@ -1,7 +1,8 @@
-# ABK External Module Development
+# ABK Dirty SELinux Guard Development
 
-An ABK external module is a normal Git repository. During a build, ABK clones
-the repository and runs `setup.sh` at the configured stage.
+This repository is an ABK external module. During a build, ABK clones the
+repository and runs `setup.sh` at the configured stage. This module performs
+dirty SELinux policy cleanup at `after_patch`.
 
 ## Input Format
 
@@ -26,22 +27,24 @@ Rules:
 
 ### after_patch
 
-Use this stage for source integration:
+The guard runs here because ABK built-in source integrations have already
+applied their patches, while compilation has not started yet. It scans:
 
-- Apply `git apply` patches.
-- Copy drivers, Kconfig files, Makefiles, or headers.
-- Add compatibility fixes after ABK built-in patches.
+- `$KERNEL_ROOT`
+- `$KERNEL_ROOT/KernelSU`
+- `$KERNEL_ROOT/common/drivers/kernelsu`
+- `$KERNEL_ROOT/drivers/kernelsu`
+- `$SUSFS4KSU`, `$KERNEL_PATCHES`, and `$SUKISU_PATCHES` when present
+- `$GITHUB_WORKSPACE` as a fallback, excluding this module directory
 
-At this point the kernel source tree exists and ABK built-in patches have mostly
-finished, but final kernel name and build-time settings may not be written yet.
+It removes direct one-line targeted grants from text policy/source files and
+patch-added lines in unified diffs.
 
 ### before_build
 
-Use this stage for final configuration:
+The guard does not run here. It logs and exits.
 
-- Edit `$DEFCONFIG`.
-- Read `KBUILD_BUILD_TIMESTAMP` or `KBUILD_BUILD_VERSION`.
-- Validate the source tree and configuration immediately before compilation.
+Use `after_patch` for this module.
 
 ## Environment Variables
 
@@ -76,6 +79,12 @@ Conditional variables:
 - Standard GitHub Actions variables such as `GITHUB_REPOSITORY`, `GITHUB_REF`,
   `GITHUB_SHA`, `GITHUB_RUN_ID`, `RUNNER_OS`, `RUNNER_TEMP`, `HOME`, and `PATH`
   are also available.
+
+## Guard Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ABK_DIRTY_SEPOLICY_STRICT` | `1` | Fail when targeted dirty rules remain after cleanup |
 
 ## Helper Functions
 
@@ -141,15 +150,15 @@ fi
 At minimum, run:
 
 ```bash
-bash -n setup.sh scripts/libabk.sh
+bash -n setup.sh scripts/libabk.sh scripts/dirty_sepolicy_guard.sh tests/dirty_sepolicy_guard_test.sh
+bash tests/dirty_sepolicy_guard_test.sh
 ```
 
-If your module includes patches, check the ABK build log and confirm:
+Check the ABK build log and confirm:
 
-- Patches apply cleanly.
 - Re-running the module does not duplicate changes.
-- Unsupported kernel versions fail clearly.
-- Kconfig symbols exist before adding strict defconfig expectations.
+- Removed dirty rules are logged with file and line numbers.
+- Remaining targeted rules fail clearly in strict mode.
 
 ## Compatibility Advice
 

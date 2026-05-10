@@ -1,27 +1,35 @@
-# ABK External Module Template
+# ABK Dirty SELinux Guard
 
-Template repository for AnyBase Kernel (ABK) custom external modules.
+External module for AnyBase Kernel (ABK) builds that cleans and blocks known
+dirty SELinux policy grants after ABK source patching.
 
-ABK clones external module repositories during the kernel build and runs
-`setup.sh` from the repository root at the configured injection stage. This
-template is intentionally safe by default: it logs the build context and does
-not modify the kernel tree until you add your own logic.
+The module targets direct SELinux rules associated with dirty sepolicy
+detection:
+
+- `system_server` granted `execmem`.
+- `untrusted_app*` granted binder `call` access to Magisk binder types.
+- `untrusted_app*` granted binder `call` access to KernelSU/KSU binder types.
+- `untrusted_app*` granted read-like access to `lsposed_file`.
+
+It removes direct one-line rules from text policy/source files and unified diff
+patch additions. If a targeted rule remains after cleanup, strict mode fails the
+build by default.
 
 ## Usage
 
-Enable "custom external modules" in the ABK app or GitHub Actions, then pass a
-module string in this format:
+Enable "custom external modules" in the ABK app or GitHub Actions, then pass
+this repository with the `after_patch` stage:
 
 ```text
-https://github.com/your-name/your-module.git;after_patch
+https://github.com/your-name/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch
 ```
 
 For ABK APP
 
 ```
-https://github.com/your-name/your-module.git
+https://github.com/your-name/ABK_NO_ANYTHING_CAN_CHECK.git
 ```
-Then choose the after_patch.
+Then choose `after_patch`.
 
 Multiple modules are separated with `|`:
 
@@ -39,57 +47,18 @@ Supported stages:
 `befor_build` is accepted by ABK as a compatibility alias, but new modules
 should use `before_build`.
 
-## Repository Layout
+## Behavior
 
-```text
-.
-|-- setup.sh
-|-- module.conf
-|-- scripts/
-|   `-- libabk.sh
-|-- patches/
-|   `-- README.md
-|-- files/
-|   `-- README.md
-`-- docs/
-    `-- development.md
-```
+- `after_patch`: scans `$KERNEL_ROOT`, known ABK patch repositories, and the
+  GitHub workspace fallback.
+- `before_build`: logs and exits; cleanup belongs before compilation inputs are
+  finalized.
+- `ABK_DIRTY_SEPOLICY_STRICT=1`: default. Remaining targeted rules fail the
+  build.
+- `ABK_DIRTY_SEPOLICY_STRICT=0`: logs remaining matches and continues.
 
-Required entry point:
-
-- `setup.sh` must exist at the repository root.
-- ABK executes it with `bash setup.sh`.
-- The current working directory is the module repository root.
-
-Recommended workflow:
-
-1. Create a new repository from this template.
-2. Update `module.conf` with your module name, version, and description.
-3. Put patch files under `patches/`.
-4. Put source files or templates under `files/`.
-5. Implement stage-specific logic in `setup.sh`.
-6. Keep every operation idempotent.
-
-## Minimal Example
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source "$MODULE_DIR/scripts/libabk.sh"
-
-abk_require_env KERNEL_ROOT DEFCONFIG CUSTOM_EXTERNAL_MODULE_STAGE
-
-case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
-  after_patch)
-    abk_apply_patch_dir "$MODULE_DIR/patches/common"
-    ;;
-  before_build)
-    abk_enable_config CONFIG_EXAMPLE_FEATURE
-    ;;
-esac
-```
+The scanner is intentionally conservative. It cleans direct one-line rules only;
+unknown multi-line constructs are reported and blocked by strict mode.
 
 ## Common Environment Variables
 
@@ -111,6 +80,15 @@ esac
 | `KBUILD_BUILD_VERSION` | Available in `before_build` |
 
 See [docs/development.md](docs/development.md) for the full development guide.
+
+## Verification
+
+Run local checks:
+
+```bash
+bash -n setup.sh scripts/libabk.sh scripts/dirty_sepolicy_guard.sh tests/dirty_sepolicy_guard_test.sh
+bash tests/dirty_sepolicy_guard_test.sh
+```
 
 ## Safety Rules
 
