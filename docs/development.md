@@ -2,7 +2,8 @@
 
 This repository is an ABK external module. During a build, ABK clones the
 repository and runs `setup.sh` at the configured stage. This module performs
-dirty SELinux policy cleanup at `after_patch`.
+dirty SELinux policy cleanup at `after_patch` and final read-only audit at
+`before_build`.
 
 ## Input Format
 
@@ -13,7 +14,7 @@ repo_url;stage|repo_url;stage
 Example:
 
 ```text
-https://github.com/your-name/net-patch.git;after_patch|https://github.com/your-name/final-config.git;before_build
+https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch|https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;before_build
 ```
 
 Rules:
@@ -31,9 +32,6 @@ The guard runs here because ABK built-in source integrations have already
 applied their patches, while compilation has not started yet. It scans:
 
 - `$KERNEL_ROOT`
-- `$KERNEL_ROOT/KernelSU`
-- `$KERNEL_ROOT/common/drivers/kernelsu`
-- `$KERNEL_ROOT/drivers/kernelsu`
 - `$SUSFS4KSU`, `$KERNEL_PATCHES`, and `$SUKISU_PATCHES` when present
 - `$GITHUB_WORKSPACE` as a fallback, excluding this module directory
 
@@ -42,9 +40,13 @@ patch-added lines in unified diffs.
 
 ### before_build
 
-The guard does not run here. It logs and exits.
+The guard runs in read-only audit mode here. It does not edit files. It fails
+strict builds when direct dirty rules remain or when likely runtime policy
+injection sources still mention the targeted subjects, types, classes, and
+permissions.
 
-Use `after_patch` for this module.
+Use both `after_patch` and `before_build` entries when debugging devices that
+are still detected after cleanup.
 
 ## Environment Variables
 
@@ -85,6 +87,7 @@ Conditional variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ABK_DIRTY_SEPOLICY_STRICT` | `1` | Fail when targeted dirty rules remain after cleanup |
+| `ABK_DIRTY_SEPOLICY_MODE` | `cleanup` | `cleanup` edits safe direct rules; `audit` is read-only |
 
 ## Helper Functions
 
@@ -159,6 +162,8 @@ Check the ABK build log and confirm:
 - Re-running the module does not duplicate changes.
 - Removed dirty rules are logged with file and line numbers.
 - Remaining targeted rules fail clearly in strict mode.
+- `before_build` audit mode reports suspicious runtime policy sources without
+  modifying files.
 
 ## Compatibility Advice
 

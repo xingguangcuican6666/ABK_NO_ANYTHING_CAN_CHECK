@@ -59,6 +59,7 @@ run_guard() {
   SUKISU_PATCHES="$WORK_DIR/kernel_patches" \
   GITHUB_WORKSPACE="$WORK_DIR" \
   DIRTY_SEPOLICY_MODULE_DIR="$WORK_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=cleanup \
   ABK_DIRTY_SEPOLICY_STRICT=1 \
     bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_test.log
 }
@@ -117,6 +118,7 @@ EOF
 
 if KERNEL_ROOT="$FAIL_DIR/kernel" \
   DIRTY_SEPOLICY_MODULE_DIR="$FAIL_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=cleanup \
   ABK_DIRTY_SEPOLICY_STRICT=1 \
     bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_fail_test.log 2>&1; then
   echo "strict mode allowed a multi-line dirty policy rule" >&2
@@ -125,6 +127,56 @@ fi
 
 if ! grep -q 'multiline' /tmp/dirty_sepolicy_guard_fail_test.log; then
   echo "strict failure did not report the multi-line dirty policy rule" >&2
+  exit 1
+fi
+
+AUDIT_DIRECT_DIR="$(mktemp -d "$WORK_DIR/audit-direct.XXXXXX")"
+mkdir -p "$AUDIT_DIRECT_DIR/kernel/common/security/sepolicy" "$AUDIT_DIRECT_DIR/module"
+AUDIT_DIRECT_FILE="$AUDIT_DIRECT_DIR/kernel/common/security/sepolicy/app.te"
+cat > "$AUDIT_DIRECT_FILE" <<'EOF'
+allow untrusted_app ksu:binder call;
+allow shell shell:process sigchld;
+EOF
+
+if KERNEL_ROOT="$AUDIT_DIRECT_DIR/kernel" \
+  DIRTY_SEPOLICY_MODULE_DIR="$AUDIT_DIRECT_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=audit \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_audit_direct.log 2>&1; then
+  echo "audit mode allowed a direct dirty policy rule" >&2
+  exit 1
+fi
+
+if ! grep -q 'allow untrusted_app ksu:binder call;' "$AUDIT_DIRECT_FILE"; then
+  echo "audit mode modified a direct dirty policy file" >&2
+  exit 1
+fi
+
+AUDIT_RUNTIME_DIR="$(mktemp -d "$WORK_DIR/audit-runtime.XXXXXX")"
+mkdir -p "$AUDIT_RUNTIME_DIR/kernel/KernelSU/kernel" "$AUDIT_RUNTIME_DIR/module"
+cat > "$AUDIT_RUNTIME_DIR/kernel/KernelSU/kernel/core_hook.c" <<'EOF'
+void install_runtime_policy(void)
+{
+    policydb_update(db);
+    const char *source = "untrusted_app";
+    const char *target = "kernelsu";
+    const char *klass = "binder";
+    const char *perm = "call";
+}
+EOF
+
+if KERNEL_ROOT="$AUDIT_RUNTIME_DIR/kernel" \
+  DIRTY_SEPOLICY_MODULE_DIR="$AUDIT_RUNTIME_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=audit \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_audit_runtime.log 2>&1; then
+  echo "audit mode allowed a suspicious runtime policy source" >&2
+  exit 1
+fi
+
+if ! grep -q 'runtime_untrusted_app_ksu_binder_policy_source' /tmp/dirty_sepolicy_guard_audit_runtime.log; then
+  echo "audit mode did not report the runtime policy source category" >&2
+  cat /tmp/dirty_sepolicy_guard_audit_runtime.log >&2
   exit 1
 fi
 

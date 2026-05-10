@@ -2,7 +2,12 @@
 
 这是一个 AnyBase Kernel (ABK) 自定义外部模块，用于在 ABK 内置补丁完成后清理并阻断已知的 dirty SELinux policy 规则。
 
-模块运行在 `after_patch` 阶段，只处理构建树里的文本策略、源码片段和 unified diff 补丁。它不会修改 Android Framework、App Zygote 或 `SELinux.checkSELinuxAccess` 行为；目标是移除构建输入中不应继续存在的高暴露 SELinux allow 规则。
+模块分两阶段运行：
+
+- `after_patch`：清理构建输入中可安全删除的直接 dirty allow 规则。
+- `before_build`：最终只读审计，发现残留规则或疑似运行时 policy 注入源就失败并输出证据。
+
+它不会修改 Android Framework、App Zygote 或 `SELinux.checkSELinuxAccess` 行为；目标是移除或阻断构建输入中不应继续存在的高暴露 SELinux 规则来源。
 
 ## 处理范围
 
@@ -13,16 +18,16 @@
 - `untrusted_app*` 被授予调用 KernelSU/KSU/SukiSU/ReSukiSU binder 类型的 `binder call`。
 - `untrusted_app*` 被授予读取 `lsposed_file` 的 read/open/getattr/map/ioctl/lock 类权限。
 
-模块会自动删除可安全识别的单行规则和补丁新增行。多行或无法安全改写的规则不会被盲改；严格模式下会直接让构建失败，并在日志里给出文件和行号。
+模块会在 `after_patch` 自动删除可安全识别的单行规则和补丁新增行。多行、无法安全改写的规则、以及疑似运行时 policy 注入代码不会被盲改；`before_build` 严格审计会直接让构建失败，并在日志里给出文件、行号、分类和上下文。
 
 ## ABK 使用方式
 
 在 ABK App 或 GitHub Actions 中启用“自定义外部模块”，并配置本仓库。
 
-GitHub Actions 模块字符串：
+GitHub Actions 模块字符串需要同时配置两个阶段：
 
 ```text
-https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch
+https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch|https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;before_build
 ```
 
 ABK App：
@@ -31,9 +36,7 @@ ABK App：
 https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git
 ```
 
-然后阶段选择 `after_patch`。
-
-不要把本模块配置到 `before_build`。该阶段只会打印提示并退出，因为清理应发生在源码补丁完成之后、编译开始之前。
+先添加一次并选择 `after_patch`，再添加一次并选择 `before_build`。如果 App 当前只支持一个阶段，优先用 `after_patch` 清理；但最终排查被检测问题时必须跑 `before_build` 审计。
 
 ## 行为说明
 
@@ -42,12 +45,20 @@ https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git
 - 在没有其他可用扫描根目录时，回退扫描 `$GITHUB_WORKSPACE`。
 - 跳过 `.git`、`.repo`、常见构建输出目录、压缩包、镜像和二进制文件。
 - 默认严格模式：发现残留目标规则就失败。
+- `before_build` 为只读审计模式，不会修改任何文件。
 
 严格模式开关：
 
 ```bash
 ABK_DIRTY_SEPOLICY_STRICT=1  # 默认，残留目标规则会失败
 ABK_DIRTY_SEPOLICY_STRICT=0  # 只警告，不阻断构建
+```
+
+内部模式开关由 `setup.sh` 按阶段设置：
+
+```bash
+ABK_DIRTY_SEPOLICY_MODE=cleanup  # after_patch
+ABK_DIRTY_SEPOLICY_MODE=audit    # before_build
 ```
 
 ## 本地验证
@@ -63,6 +74,8 @@ bash tests/dirty_sepolicy_guard_test.sh
 - patch hunk 行数重算。
 - 重复运行幂等。
 - 多行目标规则在严格模式下失败。
+- `before_build` 审计失败时不修改文件。
+- 疑似运行时 policy 注入源会被审计拦截。
 - 非目标规则保留。
 
 ## 主要文件

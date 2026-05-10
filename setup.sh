@@ -22,12 +22,16 @@ abk_log "kernel root: $KERNEL_ROOT"
 case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
   after_patch)
     abk_log "after_patch: cleaning dirty SELinux policy grants"
-    DIRTY_SEPOLICY_MODULE_DIR="$MODULE_DIR" \
+    ABK_DIRTY_SEPOLICY_MODE=cleanup \
+      DIRTY_SEPOLICY_MODULE_DIR="$MODULE_DIR" \
       bash "$MODULE_DIR/scripts/dirty_sepolicy_guard.sh"
     ;;
 
   before_build)
-    abk_log "before_build: dirty SELinux guard runs at after_patch only"
+    abk_log "before_build: auditing dirty SELinux policy grants"
+    ABK_DIRTY_SEPOLICY_MODE=audit \
+      DIRTY_SEPOLICY_MODULE_DIR="$MODULE_DIR" \
+      bash "$MODULE_DIR/scripts/dirty_sepolicy_guard.sh"
     ;;
 
   *)

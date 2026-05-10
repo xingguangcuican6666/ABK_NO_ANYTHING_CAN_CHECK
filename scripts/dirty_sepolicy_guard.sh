@@ -15,6 +15,7 @@ guard_die() {
 }
 
 STRICT="${ABK_DIRTY_SEPOLICY_STRICT:-1}"
+MODE="${ABK_DIRTY_SEPOLICY_MODE:-cleanup}"
 MODULE_DIR="${DIRTY_SEPOLICY_MODULE_DIR:-}"
 
 if [ -n "$MODULE_DIR" ] && [ -d "$MODULE_DIR" ]; then
@@ -242,6 +243,66 @@ function statement_finished(line, lower) {
   }
 
   return 0
+}
+
+function compact_context(text) {
+  gsub(/[[:space:]]+/, " ", text)
+  sub(/^[[:space:]]+/, "", text)
+  sub(/[[:space:]]+$/, "", text)
+  return substr(text, 1, 500)
+}
+
+function has_policy_helper(lower) {
+  if (lower ~ /(^|[^[:alnum:]_])(allow|ksu_allow)[[:space:]]*\(/ ||
+      lower ~ /(^|[^[:alnum:]_])magiskpolicy([^[:alnum:]_]|$)/ ||
+      lower ~ /(^|[^[:alnum:]_])allow_domain[[:space:]]*\(/ ||
+      lower ~ /(^|[^[:alnum:]_])security_load_policy([^[:alnum:]_]|$)/ ||
+      lower ~ /(^|[^[:alnum:]_])selinux_android_load_policy([^[:alnum:]_]|$)/ ||
+      lower ~ /(^|[^[:alnum:]_])load_policy([^[:alnum:]_]|$)/ ||
+      lower ~ /(^|[^[:alnum:]_])policydb[[:alnum:]_]*([^[:alnum:]_]|$)/ ||
+      lower ~ /(^|[^[:alnum:]_])avtab[[:alnum:]_]*([^[:alnum:]_]|$)/) {
+    return 1
+  }
+
+  return 0
+}
+
+function audit_context_category(raw, lower, has_untrusted, has_binder, has_call, has_file_read) {
+  lower = tolower(raw)
+
+  if (!has_policy_helper(lower)) {
+    return ""
+  }
+
+  has_untrusted = lower ~ /(^|[^[:alnum:]_])untrusted_app[[:alnum:]_]*([^[:alnum:]_]|$)/
+  has_binder = has_token(lower, "binder")
+  has_call = has_token(lower, "call")
+  has_file_read = 0
+  if (has_token(lower, "read") || has_token(lower, "open") || has_token(lower, "getattr") ||
+      has_token(lower, "map") || has_token(lower, "ioctl") || has_token(lower, "lock")) {
+    has_file_read = 1
+  }
+
+  if (has_token(lower, "system_server") && has_token(lower, "execmem")) {
+    return "runtime_system_server_execmem_policy_source"
+  }
+
+  if (has_untrusted && has_binder && has_call &&
+      (has_token(lower, "magisk") || has_token(lower, "magiskd") || has_token(lower, "magisk_file"))) {
+    return "runtime_untrusted_app_magisk_binder_policy_source"
+  }
+
+  if (has_untrusted && has_binder && has_call &&
+      (has_token(lower, "ksu") || has_token(lower, "kernelsu") ||
+       has_token(lower, "sukisu") || has_token(lower, "resukisu"))) {
+    return "runtime_untrusted_app_ksu_binder_policy_source"
+  }
+
+  if (has_untrusted && has_token(lower, "lsposed_file") && has_file_read) {
+    return "runtime_untrusted_app_lsposed_file_policy_source"
+  }
+
+  return ""
 }
 '
 
@@ -473,6 +534,105 @@ scan_remaining_file() {
   fi
 }
 
+scan_suspicious_file() {
+  local file="$1"
+  local matches
+
+  if is_patch_file "$file"; then
+    matches="$(
+      awk "$dirty_policy_awk"'
+        function push_window(line, number, i) {
+          for (i = 1; i < 8; i++) {
+            window[i] = window[i + 1]
+            numbers[i] = numbers[i + 1]
+          }
+          window[8] = line
+          numbers[8] = number
+        }
+
+        function joined_window(i, out, first) {
+          first = 0
+          out = ""
+          for (i = 1; i <= 8; i++) {
+            if (window[i] != "") {
+              if (!first) {
+                first = numbers[i]
+              }
+              out = out " " window[i]
+            }
+          }
+          window_start = first ? first : FNR
+          return out
+        }
+
+        /^\+/ && $0 !~ /^\+\+\+/ {
+          candidate = substr($0, 2)
+          push_window(candidate, FNR)
+          context = joined_window()
+          category = audit_context_category(context)
+          if (category != "") {
+            key = category ":" compact_context(context)
+            if (!seen[key]++) {
+              printf "%s:%d:%s:context:%s\n", FILENAME, window_start, category, compact_context(context)
+            }
+          }
+        }
+
+        $0 !~ /^\+/ || $0 ~ /^\+\+\+/ {
+          delete window
+          delete numbers
+        }
+      ' "$file"
+    )"
+  else
+    matches="$(
+      awk "$dirty_policy_awk"'
+        function push_window(line, number, i) {
+          for (i = 1; i < 8; i++) {
+            window[i] = window[i + 1]
+            numbers[i] = numbers[i + 1]
+          }
+          window[8] = line
+          numbers[8] = number
+        }
+
+        function joined_window(i, out, first) {
+          first = 0
+          out = ""
+          for (i = 1; i <= 8; i++) {
+            if (window[i] != "") {
+              if (!first) {
+                first = numbers[i]
+              }
+              out = out " " window[i]
+            }
+          }
+          window_start = first ? first : FNR
+          return out
+        }
+
+        {
+          push_window($0, FNR)
+          context = joined_window()
+          category = audit_context_category(context)
+          if (category != "") {
+            key = category ":" compact_context(context)
+            if (!seen[key]++) {
+              printf "%s:%d:%s:context:%s\n", FILENAME, window_start, category, compact_context(context)
+            }
+          }
+        }
+      ' "$file"
+    )"
+  fi
+
+  if [ -n "$matches" ]; then
+    while IFS= read -r line; do
+      REMAINING_MATCHES+=("$line")
+    done <<< "$matches"
+  fi
+}
+
 for_each_candidate_file() {
   local callback="$1"
   local file
@@ -560,6 +720,11 @@ clean_candidate() {
 }
 
 main() {
+  case "$MODE" in
+    cleanup|audit) ;;
+    *) guard_die "unsupported ABK_DIRTY_SEPOLICY_MODE: $MODE" ;;
+  esac
+
   discover_scan_roots
 
   if [ "${#SCAN_ROOTS[@]}" -eq 0 ]; then
@@ -573,11 +738,24 @@ main() {
   collect_candidate_files
   guard_log "total unique candidates: ${#CANDIDATE_FILES[@]}"
 
-  for_each_candidate_file clean_candidate
+  guard_log "mode: $MODE"
+
+  if [ "$MODE" = "cleanup" ]; then
+    for_each_candidate_file clean_candidate
+  fi
+
   for_each_candidate_file scan_remaining_file
 
+  if [ "$MODE" = "audit" ]; then
+    for_each_candidate_file scan_suspicious_file
+  fi
+
   if [ "${#MODIFIED_FILES[@]}" -eq 0 ]; then
-    guard_log "no dirty SELinux policy grants needed cleanup"
+    if [ "$MODE" = "cleanup" ]; then
+      guard_log "no dirty SELinux policy grants needed cleanup"
+    else
+      guard_log "audit mode did not modify files"
+    fi
   else
     guard_log "modified files:"
     printf '  %s\n' "${MODIFIED_FILES[@]}"
