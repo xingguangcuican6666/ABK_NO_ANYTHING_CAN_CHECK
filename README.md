@@ -1,105 +1,77 @@
 # ABK Dirty SELinux Guard
 
-External module for AnyBase Kernel (ABK) builds that cleans and blocks known
-dirty SELinux policy grants after ABK source patching.
+这是一个 AnyBase Kernel (ABK) 自定义外部模块，用于在 ABK 内置补丁完成后清理并阻断已知的 dirty SELinux policy 规则。
 
-The module targets direct SELinux rules associated with dirty sepolicy
-detection:
+模块运行在 `after_patch` 阶段，只处理构建树里的文本策略、源码片段和 unified diff 补丁。它不会修改 Android Framework、App Zygote 或 `SELinux.checkSELinuxAccess` 行为；目标是移除构建输入中不应继续存在的高暴露 SELinux allow 规则。
 
-- `system_server` granted `execmem`.
-- `untrusted_app*` granted binder `call` access to Magisk binder types.
-- `untrusted_app*` granted binder `call` access to KernelSU/KSU binder types.
-- `untrusted_app*` granted read-like access to `lsposed_file`.
+## 处理范围
 
-It removes direct one-line rules from text policy/source files and unified diff
-patch additions. If a targeted rule remains after cleanup, strict mode fails the
-build by default.
+当前覆盖四类直接规则：
 
-## Usage
+- `system_server` 被授予 `process execmem`。
+- `untrusted_app*` 被授予调用 Magisk binder 类型的 `binder call`。
+- `untrusted_app*` 被授予调用 KernelSU/KSU/SukiSU/ReSukiSU binder 类型的 `binder call`。
+- `untrusted_app*` 被授予读取 `lsposed_file` 的 read/open/getattr/map/ioctl/lock 类权限。
 
-Enable "custom external modules" in the ABK app or GitHub Actions, then pass
-this repository with the `after_patch` stage:
+模块会自动删除可安全识别的单行规则和补丁新增行。多行或无法安全改写的规则不会被盲改；严格模式下会直接让构建失败，并在日志里给出文件和行号。
 
-```text
-https://github.com/your-name/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch
-```
+## ABK 使用方式
 
-For ABK APP
+在 ABK App 或 GitHub Actions 中启用“自定义外部模块”，并配置本仓库。
 
-```
-https://github.com/your-name/ABK_NO_ANYTHING_CAN_CHECK.git
-```
-Then choose `after_patch`.
-
-Multiple modules are separated with `|`:
+GitHub Actions 模块字符串：
 
 ```text
-https://github.com/your-name/module-a.git;after_patch|https://github.com/your-name/module-b.git;before_build
+https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git;after_patch
 ```
 
-Supported stages:
+ABK App：
 
-| Stage | Timing | Typical use |
-| --- | --- | --- |
-| `after_patch` | After ABK finishes built-in source integrations such as SUSFS, ZRAM, BBG, DDK, Re-Kernel, NTsync, IPSet, and BBR | Apply source patches, copy driver files, edit Kconfig or Makefile files |
-| `before_build` | After ABK sets the kernel name and build timestamp, immediately before compilation | Final defconfig edits, generated files, validation checks |
+```text
+https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git
+```
 
-`befor_build` is accepted by ABK as a compatibility alias, but new modules
-should use `before_build`.
+然后阶段选择 `after_patch`。
 
-## Behavior
+不要把本模块配置到 `before_build`。该阶段只会打印提示并退出，因为清理应发生在源码补丁完成之后、编译开始之前。
 
-- `after_patch`: scans `$KERNEL_ROOT`, known ABK patch repositories, and the
-  GitHub workspace fallback.
-- `before_build`: logs and exits; cleanup belongs before compilation inputs are
-  finalized.
-- `ABK_DIRTY_SEPOLICY_STRICT=1`: default. Remaining targeted rules fail the
-  build.
-- `ABK_DIRTY_SEPOLICY_STRICT=0`: logs remaining matches and continues.
+## 行为说明
 
-The scanner is intentionally conservative. It cleans direct one-line rules only;
-unknown multi-line constructs are reported and blocked by strict mode.
+- 扫描 `$KERNEL_ROOT`。
+- 扫描 `$SUSFS4KSU`、`$KERNEL_PATCHES`、`$SUKISU_PATCHES`，如果这些目录存在。
+- 在没有其他可用扫描根目录时，回退扫描 `$GITHUB_WORKSPACE`。
+- 跳过 `.git`、`.repo`、常见构建输出目录、压缩包、镜像和二进制文件。
+- 默认严格模式：发现残留目标规则就失败。
 
-## Common Environment Variables
+严格模式开关：
 
-| Variable | Meaning |
-| --- | --- |
-| `GITHUB_WORKSPACE` | GitHub Actions workspace and ABK repository root |
-| `CONFIG` | Build tuple, for example `android15-6.6-118` |
-| `KERNEL_ROOT` | Kernel source directory |
-| `DEFCONFIG` | GKI defconfig path |
-| `CUSTOM_EXTERNAL_MODULE_STAGE` | Current stage, `after_patch` or `before_build` |
-| `CUSTOM_EXTERNAL_MODULES_MANIFEST` | Parsed ABK module manifest |
-| `ZZH_PATCHES` | ABK repository root |
-| `SUSFS4KSU` | SUSFS repository path when SUSFS is enabled |
-| `KERNEL_PATCHES` | `WildKernels/kernel_patches` repository path |
-| `SUKISU_PATCHES` | `ShirkNeko/SukiSU_patch` repository path |
-| `ANYKERNEL3` | AnyKernel3 repository path |
-| `ACTION_BUILD` | Action-Build repository path |
-| `KBUILD_BUILD_TIMESTAMP` | Available in `before_build` |
-| `KBUILD_BUILD_VERSION` | Available in `before_build` |
+```bash
+ABK_DIRTY_SEPOLICY_STRICT=1  # 默认，残留目标规则会失败
+ABK_DIRTY_SEPOLICY_STRICT=0  # 只警告，不阻断构建
+```
 
-See [docs/development.md](docs/development.md) for the full development guide.
-
-## Verification
-
-Run local checks:
+## 本地验证
 
 ```bash
 bash -n setup.sh scripts/libabk.sh scripts/dirty_sepolicy_guard.sh tests/dirty_sepolicy_guard_test.sh
 bash tests/dirty_sepolicy_guard_test.sh
 ```
 
-## Safety Rules
+测试覆盖：
 
-- Do not commit tokens, private keys, device private data, or opaque binaries.
-- Do not download and execute unaudited remote scripts.
-- Validate kernel versions and target files before modifying the source tree.
-- Fail clearly with `exit 1` when a required condition is not met.
-- Prefer changing only `$KERNEL_ROOT`, `$DEFCONFIG`, or files inside this
-  module repository.
+- 四类目标规则的清理。
+- patch hunk 行数重算。
+- 重复运行幂等。
+- 多行目标规则在严格模式下失败。
+- 非目标规则保留。
 
-## License
+## 主要文件
 
-GPL-3.0. Make sure any third-party code or patches you add are compatible with
-the target kernel and this repository license.
+- `setup.sh`：ABK 执行入口。
+- `scripts/dirty_sepolicy_guard.sh`：dirty SELinux 规则清理和残留扫描逻辑。
+- `tests/dirty_sepolicy_guard_test.sh`：本地 shell fixture 测试。
+- `docs/development.md`：开发细节和 ABK 外部模块上下文。
+
+## 许可证
+
+GPL-3.0。引入第三方代码或补丁时，请确认其许可证与目标内核和本仓库兼容。
