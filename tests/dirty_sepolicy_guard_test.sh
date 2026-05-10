@@ -12,6 +12,7 @@ trap cleanup EXIT
 
 mkdir -p "$WORK_DIR/kernel/common/security/sepolicy"
 mkdir -p "$WORK_DIR/kernel/KernelSU/kernel/selinux"
+mkdir -p "$WORK_DIR/kernel/irrelevant"
 mkdir -p "$WORK_DIR/kernel_patches"
 mkdir -p "$WORK_DIR/module"
 
@@ -48,9 +49,14 @@ index 1111111..2222222 100644
  allow shell shell:file read;
 EOF
 
+for i in $(seq 1 200); do
+  printf 'allow untrusted_app ksu:binder call;\n' > "$WORK_DIR/kernel/irrelevant/file-$i.txt"
+done
+
 run_guard() {
   KERNEL_ROOT="$WORK_DIR/kernel" \
-  KERNEL_PATCHES="$WORK_DIR/kernel_patches" \
+  KERNEL_PATCHES="$WORK_DIR/kernel/KernelSU" \
+  SUKISU_PATCHES="$WORK_DIR/kernel_patches" \
   GITHUB_WORKSPACE="$WORK_DIR" \
   DIRTY_SEPOLICY_MODULE_DIR="$WORK_DIR/module" \
   ABK_DIRTY_SEPOLICY_STRICT=1 \
@@ -59,6 +65,17 @@ run_guard() {
 
 run_guard
 run_guard
+
+if grep -q "$WORK_DIR/kernel/KernelSU$" /tmp/dirty_sepolicy_guard_test.log; then
+  echo "nested KernelSU root was scanned separately" >&2
+  exit 1
+fi
+
+if ! grep -q 'total unique candidates: 3' /tmp/dirty_sepolicy_guard_test.log; then
+  echo "candidate prefilter did not keep the expected focused file set" >&2
+  cat /tmp/dirty_sepolicy_guard_test.log >&2
+  exit 1
+fi
 
 if grep -Eq 'system_server.*execmem|untrusted_app.*(ksu|magisk).*binder.*call|untrusted_app.*lsposed_file' "$POLICY_FILE"; then
   echo "dirty policy rule remained in policy file" >&2

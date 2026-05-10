@@ -22,6 +22,7 @@ if [ -n "$MODULE_DIR" ] && [ -d "$MODULE_DIR" ]; then
 fi
 
 declare -a SCAN_ROOTS=()
+declare -a CANDIDATE_FILES=()
 declare -a MODIFIED_FILES=()
 declare -a REMAINING_MATCHES=()
 
@@ -35,23 +36,30 @@ canonical_dir() {
 add_scan_root() {
   local path="$1"
   local resolved existing
+  local -a kept_roots=()
 
   resolved="$(canonical_dir "$path" 2>/dev/null || true)"
   [ -n "$resolved" ] || return 0
 
-  for existing in "${SCAN_ROOTS[@]:-}"; do
-    [ "$existing" = "$resolved" ] && return 0
+  for existing in "${SCAN_ROOTS[@]}"; do
+    if path_is_under "$resolved" "$existing"; then
+      return 0
+    fi
+
+    if path_is_under "$existing" "$resolved"; then
+      continue
+    fi
+
+    kept_roots+=("$existing")
   done
 
+  SCAN_ROOTS=("${kept_roots[@]}")
   SCAN_ROOTS+=("$resolved")
 }
 
 discover_scan_roots() {
   if [ -n "${KERNEL_ROOT:-}" ]; then
     add_scan_root "$KERNEL_ROOT"
-    add_scan_root "$KERNEL_ROOT/KernelSU"
-    add_scan_root "$KERNEL_ROOT/common/drivers/kernelsu"
-    add_scan_root "$KERNEL_ROOT/drivers/kernelsu"
   fi
 
   add_scan_root "${SUSFS4KSU:-}"
@@ -107,6 +115,17 @@ is_candidate_file() {
   esac
 
   return 1
+}
+
+add_candidate_file() {
+  local file="$1"
+  local existing
+
+  for existing in "${CANDIDATE_FILES[@]}"; do
+    [ "$existing" = "$file" ] && return 0
+  done
+
+  CANDIDATE_FILES+=("$file")
 }
 
 skip_file() {
@@ -456,14 +475,77 @@ scan_remaining_file() {
 
 for_each_candidate_file() {
   local callback="$1"
-  local root file
+  local file
 
-  for root in "${SCAN_ROOTS[@]:-}"; do
+  for file in "${CANDIDATE_FILES[@]}"; do
+    "$callback" "$file"
+  done
+}
+
+collect_candidate_files() {
+  local root file before after added
+
+  for root in "${SCAN_ROOTS[@]}"; do
+    before="${#CANDIDATE_FILES[@]}"
+    guard_log "scanning root: $root"
+
     while IFS= read -r -d '' file; do
       skip_file "$file" && continue
       file_is_text "$file" || continue
-      "$callback" "$file"
-    done < <(find "$root" -type f -print0)
+      add_candidate_file "$file"
+    done < <(
+      find "$root" \
+        \( -type d \( \
+          -name .git -o \
+          -name .repo -o \
+          -name out -o \
+          -name build -o \
+          -name dist -o \
+          -name target -o \
+          -name .gradle -o \
+          -name node_modules -o \
+          -name 'bazel-*' \
+        \) -prune \) -o \
+        \( -type f \( \
+          -iname '*.te' -o \
+          -iname '*.cil' -o \
+          -iname '*.conf' -o \
+          -iname '*.policy' -o \
+          -iname '*.rules' -o \
+          -iname '*.rule' -o \
+          -iname '*.sepolicy' -o \
+          -iname '*.patch' -o \
+          -iname '*.diff' -o \
+          \( \
+            \( -ipath '*selinux*' -o \
+               -ipath '*sepolicy*' -o \
+               -ipath '*policy*' -o \
+               -ipath '*kernelsu*' -o \
+               -ipath '*sukisu*' -o \
+               -ipath '*resukisu*' -o \
+               -ipath '*magisk*' -o \
+               -ipath '*lsposed*' -o \
+               -ipath '*susfs*' \
+            \) -a \( \
+              -iname '*.c' -o \
+              -iname '*.h' -o \
+              -iname '*.cc' -o \
+              -iname '*.cpp' -o \
+              -iname '*.inc' -o \
+              -iname '*.sh' -o \
+              -iname '*.py' -o \
+              -iname '*.mk' -o \
+              -iname 'makefile' -o \
+              -iname '*.bp' -o \
+              -iname '*.bzl' \
+            \) \
+          \) \
+        \) -print0 \)
+    )
+
+    after="${#CANDIDATE_FILES[@]}"
+    added=$((after - before))
+    guard_log "root candidates: $added"
   done
 }
 
@@ -487,6 +569,9 @@ main() {
 
   guard_log "scan roots:"
   printf '  %s\n' "${SCAN_ROOTS[@]}"
+
+  collect_candidate_files
+  guard_log "total unique candidates: ${#CANDIDATE_FILES[@]}"
 
   for_each_candidate_file clean_candidate
   for_each_candidate_file scan_remaining_file
