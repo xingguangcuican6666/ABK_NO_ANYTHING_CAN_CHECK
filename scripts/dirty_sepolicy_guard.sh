@@ -24,6 +24,7 @@ fi
 
 declare -a SCAN_ROOTS=()
 declare -a CANDIDATE_FILES=()
+declare -a KSU_RULES_FILES=()
 declare -a MODIFIED_FILES=()
 declare -a REMAINING_MATCHES=()
 
@@ -129,6 +130,17 @@ add_candidate_file() {
   CANDIDATE_FILES+=("$file")
 }
 
+add_ksu_rules_file() {
+  local file="$1"
+  local existing
+
+  for existing in "${KSU_RULES_FILES[@]}"; do
+    [ "$existing" = "$file" ] && return 0
+  done
+
+  KSU_RULES_FILES+=("$file")
+}
+
 skip_file() {
   local file="$1"
   local lower
@@ -155,6 +167,50 @@ skip_file() {
 file_is_text() {
   local file="$1"
   grep -Iq . "$file"
+}
+
+is_kernelsu_rules_file() {
+  local file="$1"
+
+  [ -f "$file" ] || return 1
+  case "$file" in
+    */selinux/rules.c) ;;
+    *) return 1 ;;
+  esac
+
+  grep -qF 'apply_kernelsu_rules' "$file" || return 1
+  grep -qF 'handle_sepolicy' "$file" || return 1
+  grep -qF 'KERNEL_SU_DOMAIN' "$file" || return 1
+  return 0
+}
+
+discover_kernelsu_rules_files() {
+  local root file
+
+  KSU_RULES_FILES=()
+
+  for root in "${SCAN_ROOTS[@]}"; do
+    while IFS= read -r -d '' file; do
+      is_kernelsu_rules_file "$file" || continue
+      add_ksu_rules_file "$file"
+    done < <(
+      find "$root" \
+        \( -type d \( \
+          -name .git -o \
+          -name .repo -o \
+          -name out -o \
+          -name build -o \
+          -name dist -o \
+          -name target -o \
+          -name .gradle -o \
+          -name node_modules -o \
+          -name 'bazel-*' \
+        \) -prune \) -o \
+        \( -type f -path '*/selinux/rules.c' -print0 \)
+    )
+  done
+
+  guard_log "KernelSU rules.c candidates: ${#KSU_RULES_FILES[@]}"
 }
 
 dirty_policy_awk='
@@ -709,6 +765,245 @@ collect_candidate_files() {
   done
 }
 
+write_kernelsu_runtime_guard() {
+  local output="$1"
+
+  cat > "$output" <<'GUARD'
+/* ABK_DIRTY_SEPOLICY_RUNTIME_GUARD: block detector-signature policy grants. */
+static bool abk_dirty_sepolicy_streq(const char *value, const char *literal)
+{
+    return value && literal && strcmp(value, literal) == 0;
+}
+
+static bool abk_dirty_sepolicy_all_or(const char *value, const char *literal)
+{
+    return !value || abk_dirty_sepolicy_streq(value, literal);
+}
+
+static bool abk_dirty_sepolicy_starts_with(const char *value, const char *prefix)
+{
+    return value && prefix && strncmp(value, prefix, strlen(prefix)) == 0;
+}
+
+static bool abk_dirty_sepolicy_matches_any(const char *value, const char *a,
+                                           const char *b, const char *c,
+                                           const char *d, const char *e)
+{
+    return !value ||
+           abk_dirty_sepolicy_streq(value, a) ||
+           abk_dirty_sepolicy_streq(value, b) ||
+           abk_dirty_sepolicy_streq(value, c) ||
+           abk_dirty_sepolicy_streq(value, d) ||
+           abk_dirty_sepolicy_streq(value, e);
+}
+
+static bool abk_dirty_sepolicy_untrusted_source(const char *source)
+{
+    return !source ||
+           abk_dirty_sepolicy_streq(source, "domain") ||
+           abk_dirty_sepolicy_streq(source, "untrusted_app") ||
+           abk_dirty_sepolicy_starts_with(source, "untrusted_app_");
+}
+
+static bool abk_dirty_sepolicy_system_server_source(const char *source)
+{
+    return !source ||
+           abk_dirty_sepolicy_streq(source, "domain") ||
+           abk_dirty_sepolicy_streq(source, "system_server");
+}
+
+static bool abk_dirty_sepolicy_file_read_perm(const char *perm)
+{
+    return !perm ||
+           abk_dirty_sepolicy_streq(perm, "read") ||
+           abk_dirty_sepolicy_streq(perm, "open") ||
+           abk_dirty_sepolicy_streq(perm, "getattr") ||
+           abk_dirty_sepolicy_streq(perm, "map") ||
+           abk_dirty_sepolicy_streq(perm, "ioctl") ||
+           abk_dirty_sepolicy_streq(perm, "lock");
+}
+
+static bool abk_dirty_sepolicy_should_skip(const struct sepol_data *header,
+                                           const char **args)
+{
+    const char *source;
+    const char *target;
+    const char *class;
+    const char *perm;
+
+    if (header->cmd != KSU_SEPOLICY_CMD_NORMAL_PERM ||
+        header->subcmd != KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW) {
+        return false;
+    }
+
+    source = args[0];
+    target = args[1];
+    class = args[2];
+    perm = args[3];
+
+    if (abk_dirty_sepolicy_system_server_source(source) &&
+        abk_dirty_sepolicy_all_or(class, "process") &&
+        abk_dirty_sepolicy_all_or(perm, "execmem")) {
+        pr_info("ABK: skipped dirty sepolicy system_server execmem grant\n");
+        return true;
+    }
+
+    if (abk_dirty_sepolicy_untrusted_source(source) &&
+        abk_dirty_sepolicy_matches_any(target, KERNEL_SU_DOMAIN, "ksu", "kernelsu", "sukisu", "resukisu") &&
+        abk_dirty_sepolicy_all_or(class, "binder") &&
+        abk_dirty_sepolicy_all_or(perm, "call")) {
+        pr_info("ABK: skipped dirty sepolicy untrusted_app -> ksu binder grant\n");
+        return true;
+    }
+
+    if (abk_dirty_sepolicy_untrusted_source(source) &&
+        abk_dirty_sepolicy_matches_any(target, "magisk", "magiskd", "magisk_file", "magisk_tmpfs", "magisk_log") &&
+        abk_dirty_sepolicy_all_or(class, "binder") &&
+        abk_dirty_sepolicy_all_or(perm, "call")) {
+        pr_info("ABK: skipped dirty sepolicy untrusted_app -> magisk binder grant\n");
+        return true;
+    }
+
+    if (abk_dirty_sepolicy_untrusted_source(source) &&
+        abk_dirty_sepolicy_all_or(target, "lsposed_file") &&
+        abk_dirty_sepolicy_all_or(class, "file") &&
+        abk_dirty_sepolicy_file_read_perm(perm)) {
+        pr_info("ABK: skipped dirty sepolicy untrusted_app -> lsposed_file grant\n");
+        return true;
+    }
+
+    return false;
+}
+
+GUARD
+}
+
+patch_kernelsu_rules_file() {
+  local file="$1"
+  local guard_file tmp log_file status has_guard has_call
+
+  guard_file="$(mktemp)"
+  tmp="$(mktemp)"
+  log_file="$(mktemp)"
+  write_kernelsu_runtime_guard "$guard_file"
+
+  has_guard=0
+  has_call=0
+  grep -qF 'static bool abk_dirty_sepolicy_should_skip' "$file" && has_guard=1
+  grep -qF 'abk_dirty_sepolicy_should_skip(header, args)' "$file" && has_call=1
+
+  if awk -v guard_file="$guard_file" -v has_guard="$has_guard" -v has_call="$has_call" '
+    BEGIN {
+      while ((getline line < guard_file) > 0) {
+        guard = guard line ORS
+      }
+      close(guard_file)
+    }
+
+    /static bool abk_dirty_sepolicy_should_skip/ {
+      has_guard = 1
+    }
+
+    /^[[:space:]]*ksu_allow\(db,[[:space:]]*"domain",[[:space:]]*KERNEL_SU_DOMAIN,[[:space:]]*"binder",[[:space:]]*ALL\);[[:space:]]*$/ {
+      print "    /* ABK_DIRTY_SEPOLICY_RUNTIME_GUARD: avoid domain -> ksu:binder detector grant. */"
+      removed_broad = 1
+      changed = 1
+      next
+    }
+
+    /^static int apply_one_sepolicy_cmd\(/ {
+      saw_apply_one = 1
+      if (!has_guard && !inserted_guard) {
+        printf "%s", guard
+        inserted_guard = 1
+        has_guard = 1
+        changed = 1
+      }
+    }
+
+    {
+      print
+      if (!has_call && saw_apply_one && !inserted_call && /^[[:space:]]*int ret;[[:space:]]*$/) {
+        print ""
+        print "    if (abk_dirty_sepolicy_should_skip(header, args)) {"
+        print "        return 0;"
+        print "    }"
+        inserted_call = 1
+        has_call = 1
+        changed = 1
+      }
+    }
+
+    END {
+      if (!has_guard) {
+        print "missing apply_one_sepolicy_cmd anchor" > "/dev/stderr"
+        exit 3
+      }
+      if (!has_call) {
+        print "missing int ret anchor" > "/dev/stderr"
+        exit 4
+      }
+      if (removed_broad) {
+        print "removed broad domain -> ksu binder rule" > "/dev/stderr"
+      }
+      exit changed ? 2 : 0
+    }
+  ' "$file" > "$tmp" 2>"$log_file"; then
+    rm -f "$guard_file" "$tmp" "$log_file"
+    guard_log "KernelSU runtime policy already patched: $file"
+    return 0
+  else
+    status="$?"
+    if [ "$status" -eq 2 ]; then
+      cat "$tmp" > "$file"
+      while IFS= read -r line; do
+        [ -n "$line" ] && guard_log "$file: $line"
+      done < "$log_file"
+      MODIFIED_FILES+=("$file")
+      rm -f "$guard_file" "$tmp" "$log_file"
+      return 0
+    fi
+    cat "$log_file" >&2 || true
+    rm -f "$guard_file" "$tmp" "$log_file"
+    guard_die "failed to patch KernelSU runtime policy source: $file"
+  fi
+}
+
+patch_kernelsu_runtime_policy() {
+  local file
+
+  discover_kernelsu_rules_files
+  for file in "${KSU_RULES_FILES[@]}"; do
+    patch_kernelsu_rules_file "$file"
+  done
+}
+
+line_number_for_pattern() {
+  local file="$1"
+  local pattern="$2"
+  awk -v pattern="$pattern" 'index($0, pattern) { print FNR; exit }' "$file"
+}
+
+audit_kernelsu_runtime_policy() {
+  local file line
+
+  discover_kernelsu_rules_files
+  for file in "${KSU_RULES_FILES[@]}"; do
+    if grep -Eq '^[[:space:]]*ksu_allow\(db,[[:space:]]*"domain",[[:space:]]*KERNEL_SU_DOMAIN,[[:space:]]*"binder",[[:space:]]*ALL\);' "$file"; then
+      line="$(line_number_for_pattern "$file" 'ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);')"
+      REMAINING_MATCHES+=("$file:${line:-0}:runtime_ksu_broad_binder_rule:domain -> ksu binder ALL still present")
+    fi
+
+    if ! grep -qF 'static bool abk_dirty_sepolicy_should_skip' "$file"; then
+      REMAINING_MATCHES+=("$file:0:runtime_guard_missing:KernelSU dirty sepolicy command filter is missing")
+    fi
+
+    if ! grep -qF 'abk_dirty_sepolicy_should_skip(header, args)' "$file"; then
+      REMAINING_MATCHES+=("$file:0:runtime_guard_call_missing:KernelSU dirty sepolicy command filter is not called")
+    fi
+  done
+}
+
 clean_candidate() {
   local file="$1"
 
@@ -741,6 +1036,7 @@ main() {
   guard_log "mode: $MODE"
 
   if [ "$MODE" = "cleanup" ]; then
+    patch_kernelsu_runtime_policy
     for_each_candidate_file clean_candidate
   fi
 
@@ -748,6 +1044,7 @@ main() {
 
   if [ "$MODE" = "audit" ]; then
     for_each_candidate_file scan_suspicious_file
+    audit_kernelsu_runtime_policy
   fi
 
   if [ "${#MODIFIED_FILES[@]}" -eq 0 ]; then

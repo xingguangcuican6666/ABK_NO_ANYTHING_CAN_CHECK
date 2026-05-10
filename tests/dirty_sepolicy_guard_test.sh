@@ -29,10 +29,32 @@ allow shell shell:process sigchld;
 EOF
 
 cat > "$C_FILE" <<'EOF'
-void install_rules(void)
+void apply_kernelsu_rules(void)
 {
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
     ksu_allow(db, "untrusted_app", "kernelsu", "binder", "call");
     ksu_allow(db, "shell", "shell", "process", "sigchld");
+}
+
+struct sepol_data {
+    u32 cmd;
+    u32 subcmd;
+};
+
+static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
+{
+    bool success = false;
+    int ret;
+
+    switch (header->cmd) {
+    default:
+        return 0;
+    }
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    return 0;
 }
 EOF
 
@@ -85,6 +107,130 @@ fi
 
 if grep -Eq 'untrusted_app.*kernelsu.*binder.*call' "$C_FILE"; then
   echo "dirty policy rule remained in C source" >&2
+  exit 1
+fi
+
+if grep -qF 'ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);' "$C_FILE"; then
+  echo "KernelSU broad binder rule remained in C source" >&2
+  exit 1
+fi
+
+if [ "$(grep -c 'static bool abk_dirty_sepolicy_should_skip' "$C_FILE")" -ne 1 ]; then
+  echo "KernelSU runtime guard was not inserted exactly once" >&2
+  exit 1
+fi
+
+if [ "$(grep -c 'abk_dirty_sepolicy_should_skip(header, args)' "$C_FILE")" -ne 1 ]; then
+  echo "KernelSU runtime guard call was not inserted exactly once" >&2
+  exit 1
+fi
+
+if ! KERNEL_ROOT="$WORK_DIR/kernel" \
+  KERNEL_PATCHES="$WORK_DIR/kernel/KernelSU" \
+  SUKISU_PATCHES="$WORK_DIR/kernel_patches" \
+  GITHUB_WORKSPACE="$WORK_DIR" \
+  DIRTY_SEPOLICY_MODULE_DIR="$WORK_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=audit \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_audit_clean.log 2>&1; then
+  echo "audit mode failed after KernelSU runtime policy patching" >&2
+  cat /tmp/dirty_sepolicy_guard_audit_clean.log >&2
+  exit 1
+fi
+
+PARTIAL_GUARD_DIR="$(mktemp -d "$WORK_DIR/partial-guard.XXXXXX")"
+mkdir -p "$PARTIAL_GUARD_DIR/kernel/KernelSU/kernel/selinux" "$PARTIAL_GUARD_DIR/module"
+PARTIAL_GUARD_FILE="$PARTIAL_GUARD_DIR/kernel/KernelSU/kernel/selinux/rules.c"
+cat > "$PARTIAL_GUARD_FILE" <<'EOF'
+void apply_kernelsu_rules(void)
+{
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+}
+
+struct sepol_data {
+    u32 cmd;
+    u32 subcmd;
+};
+
+static bool abk_dirty_sepolicy_should_skip(const struct sepol_data *header,
+                                           const char **args)
+{
+    return false;
+}
+
+static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
+{
+    bool success = false;
+    int ret;
+    return 0;
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    return 0;
+}
+EOF
+
+KERNEL_ROOT="$PARTIAL_GUARD_DIR/kernel" \
+  DIRTY_SEPOLICY_MODULE_DIR="$PARTIAL_GUARD_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=cleanup \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_partial_guard.log
+
+if [ "$(grep -c 'static bool abk_dirty_sepolicy_should_skip' "$PARTIAL_GUARD_FILE")" -ne 1 ]; then
+  echo "partial KernelSU guard state duplicated the runtime guard" >&2
+  exit 1
+fi
+
+if [ "$(grep -c 'abk_dirty_sepolicy_should_skip(header, args)' "$PARTIAL_GUARD_FILE")" -ne 1 ]; then
+  echo "partial KernelSU guard state did not add the runtime guard call" >&2
+  exit 1
+fi
+
+PARTIAL_CALL_DIR="$(mktemp -d "$WORK_DIR/partial-call.XXXXXX")"
+mkdir -p "$PARTIAL_CALL_DIR/kernel/KernelSU/kernel/selinux" "$PARTIAL_CALL_DIR/module"
+PARTIAL_CALL_FILE="$PARTIAL_CALL_DIR/kernel/KernelSU/kernel/selinux/rules.c"
+cat > "$PARTIAL_CALL_FILE" <<'EOF'
+void apply_kernelsu_rules(void)
+{
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+}
+
+struct sepol_data {
+    u32 cmd;
+    u32 subcmd;
+};
+
+static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
+{
+    bool success = false;
+    int ret;
+
+    if (abk_dirty_sepolicy_should_skip(header, args)) {
+        return 0;
+    }
+    return 0;
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    return 0;
+}
+EOF
+
+KERNEL_ROOT="$PARTIAL_CALL_DIR/kernel" \
+  DIRTY_SEPOLICY_MODULE_DIR="$PARTIAL_CALL_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=cleanup \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_partial_call.log
+
+if [ "$(grep -c 'static bool abk_dirty_sepolicy_should_skip' "$PARTIAL_CALL_FILE")" -ne 1 ]; then
+  echo "partial KernelSU call state did not add the runtime guard" >&2
+  exit 1
+fi
+
+if [ "$(grep -c 'abk_dirty_sepolicy_should_skip(header, args)' "$PARTIAL_CALL_FILE")" -ne 1 ]; then
+  echo "partial KernelSU call state duplicated the runtime guard call" >&2
   exit 1
 fi
 
@@ -177,6 +323,53 @@ fi
 if ! grep -q 'runtime_untrusted_app_ksu_binder_policy_source' /tmp/dirty_sepolicy_guard_audit_runtime.log; then
   echo "audit mode did not report the runtime policy source category" >&2
   cat /tmp/dirty_sepolicy_guard_audit_runtime.log >&2
+  exit 1
+fi
+
+AUDIT_KSU_DIR="$(mktemp -d "$WORK_DIR/audit-ksu.XXXXXX")"
+mkdir -p "$AUDIT_KSU_DIR/kernel/KernelSU/kernel/selinux" "$AUDIT_KSU_DIR/module"
+cat > "$AUDIT_KSU_DIR/kernel/KernelSU/kernel/selinux/rules.c" <<'EOF'
+void apply_kernelsu_rules(void)
+{
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
+}
+
+struct sepol_data {
+    u32 cmd;
+    u32 subcmd;
+};
+
+static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
+{
+    bool success = false;
+    int ret;
+    return 0;
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    return 0;
+}
+EOF
+
+if KERNEL_ROOT="$AUDIT_KSU_DIR/kernel" \
+  DIRTY_SEPOLICY_MODULE_DIR="$AUDIT_KSU_DIR/module" \
+  ABK_DIRTY_SEPOLICY_MODE=audit \
+  ABK_DIRTY_SEPOLICY_STRICT=1 \
+    bash "$ROOT_DIR/scripts/dirty_sepolicy_guard.sh" >/tmp/dirty_sepolicy_guard_audit_ksu.log 2>&1; then
+  echo "audit mode allowed unpatched KernelSU runtime policy source" >&2
+  exit 1
+fi
+
+if ! grep -q 'runtime_ksu_broad_binder_rule' /tmp/dirty_sepolicy_guard_audit_ksu.log; then
+  echo "audit mode did not report the broad KernelSU binder rule" >&2
+  cat /tmp/dirty_sepolicy_guard_audit_ksu.log >&2
+  exit 1
+fi
+
+if ! grep -q 'runtime_guard_missing' /tmp/dirty_sepolicy_guard_audit_ksu.log; then
+  echo "audit mode did not report the missing KernelSU runtime guard" >&2
+  cat /tmp/dirty_sepolicy_guard_audit_ksu.log >&2
   exit 1
 fi
 

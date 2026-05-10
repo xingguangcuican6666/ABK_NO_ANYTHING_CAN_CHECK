@@ -20,6 +20,11 @@
 
 模块会在 `after_patch` 自动删除可安全识别的单行规则和补丁新增行。多行、无法安全改写的规则、以及疑似运行时 policy 注入代码不会被盲改；`before_build` 严格审计会直接让构建失败，并在日志里给出文件、行号、分类和上下文。
 
+对 KernelSU/SukiSU/ReSukiSU，模块还会 patch `kernel/selinux/rules.c`：
+
+- 移除默认的 `domain -> ksu:binder *` broad allow，因为它会覆盖 `untrusted_app -> ksu:binder call`。
+- 在 `apply_one_sepolicy_cmd()` 中插入过滤器，阻止模块 `sepolicy.rule`、profile sepolicy 或 `ksud sepolicy` 在运行时重新加入这些检测特征规则。
+
 ## ABK 使用方式
 
 在 ABK App 或 GitHub Actions 中启用“自定义外部模块”，并配置本仓库。
@@ -43,6 +48,7 @@ https://github.com/xingguangcuican6666/ABK_NO_ANYTHING_CAN_CHECK.git
 - 扫描 `$KERNEL_ROOT`。
 - 扫描 `$SUSFS4KSU`、`$KERNEL_PATCHES`、`$SUKISU_PATCHES`，如果这些目录存在。
 - 在没有其他可用扫描根目录时，回退扫描 `$GITHUB_WORKSPACE`。
+- 自动定位并 patch KernelSU 源码里的 `*/selinux/rules.c`。
 - 跳过 `.git`、`.repo`、常见构建输出目录、压缩包、镜像和二进制文件。
 - 默认严格模式：发现残留目标规则就失败。
 - `before_build` 为只读审计模式，不会修改任何文件。
@@ -74,6 +80,8 @@ bash tests/dirty_sepolicy_guard_test.sh
 - patch hunk 行数重算。
 - 重复运行幂等。
 - 多行目标规则在严格模式下失败。
+- KernelSU broad binder 规则会被移除。
+- KernelSU runtime sepolicy handler 会插入过滤器且保持幂等。
 - `before_build` 审计失败时不修改文件。
 - 疑似运行时 policy 注入源会被审计拦截。
 - 非目标规则保留。

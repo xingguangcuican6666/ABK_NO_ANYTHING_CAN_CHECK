@@ -36,14 +36,17 @@ applied their patches, while compilation has not started yet. It scans:
 - `$GITHUB_WORKSPACE` as a fallback, excluding this module directory
 
 It removes direct one-line targeted grants from text policy/source files and
-patch-added lines in unified diffs.
+patch-added lines in unified diffs. It also patches KernelSU-family
+`*/selinux/rules.c` files by removing the broad `domain -> ksu:binder` allow
+and adding a runtime guard to `apply_one_sepolicy_cmd()`.
 
 ### before_build
 
 The guard runs in read-only audit mode here. It does not edit files. It fails
 strict builds when direct dirty rules remain or when likely runtime policy
 injection sources still mention the targeted subjects, types, classes, and
-permissions.
+permissions. It also fails if a KernelSU-family `rules.c` still contains the
+broad binder allow or is missing the runtime guard.
 
 Use both `after_patch` and `before_build` entries when debugging devices that
 are still detected after cleanup.
@@ -161,6 +164,8 @@ Check the ABK build log and confirm:
 
 - Re-running the module does not duplicate changes.
 - Removed dirty rules are logged with file and line numbers.
+- KernelSU-family `rules.c` files report `removed broad domain -> ksu binder
+  rule` during cleanup when needed.
 - Remaining targeted rules fail clearly in strict mode.
 - `before_build` audit mode reports suspicious runtime policy sources without
   modifying files.
